@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package users;
+option go_package = "github.com/apepenkov/sigilix_messenger_server/proto/users";
+
+message PublicUserInfo{
+  uint64 user_id = 1;
+  bytes ecdsa_public_key = 2;
+  string username = 3;
+  bytes initial_rsa_public_key = 4;
+}
+
+message PrivateUserInfo{
+  PublicUserInfo public_info = 1;
+  bool  search_by_username_allowed = 2;
+}
+
+
+message LoginRequest{
+  bytes client_ecdsa_public_key = 1;
+  bytes client_rsa_public_key = 2;
+}
+
+message LoginResponse{
+  PrivateUserInfo private_info = 1;
+  uint64 user_id = 2;
+  bytes server_ecdsa_public_key = 3;
+}
+
+
+message SetUsernameConfigRequest{
+  string username = 1;
+  bool search_by_username_allowed = 2;
+}
+
+message SetUsernameConfigResponse{
+  bool success = 1;
+}
+
+
+message SearchByUsernameRequest{
+  string username = 1;
+}
+
+message SearchByUsernameResponse{
+  PublicUserInfo public_info = 1;
+}
+
+
+service UserService {
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc SetUsernameConfig(SetUsernameConfigRequest) returns (SetUsernameConfigResponse);
+  rpc SearchByUsername(SearchByUsernameRequest) returns (SearchByUsernameResponse);
+}

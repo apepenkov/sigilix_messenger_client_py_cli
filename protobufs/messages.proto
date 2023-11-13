@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package messages;
+option go_package = "github.com/apepenkov/sigilix_messenger_server/proto/messages";
+
+import "users.proto";
+
+// in the following scheme, user A discloses his public info to user B
+// and when user B agrees to start a dialog with user A, he discloses his public info to user A
+// public info includes:
+// - username
+// - user id
+// - ecdsa public key
+// - rsa public key
+
+// user A wants to start a dialog with user B and sends message about that to server
+message InitChatFromInitializerRequest {
+  uint64 target_user_id = 1; // user B id
+}
+
+message InitChatFromInitializerResponse {
+  uint64 chat_id = 1;
+}
+
+// server sends message to user B about new dialog
+message InitChatFromInitializerNotification {
+  uint64 chat_id = 1;
+  users.PublicUserInfo initializer_user_info = 2; // user A public info
+}
+
+// user B agrees to start a dialog with user A and sends message about that to server
+message InitChatFromReceiverRequest {
+  uint64 chat_id = 1;
+}
+
+message InitChatFromReceiverResponse {
+  uint64 chat_id = 1;
+}
+
+// server sends message to user A about user B agreement to start a dialog
+message InitChatFromReceiverNotification {
+  uint64 chat_id = 1;
+  users.PublicUserInfo receiver_user_info = 2; // user B public info
+}
+
+
+// now, when users have started a dialog, they should create and exchange per-chat rsa keys.
+// it also can be done once in a while to prevent key compromise.
+
+message UpdateChatRsaKeyRequest {
+  uint64 chat_id = 1;
+  bytes rsa_public_key = 2;
+}
+
+message UpdateChatRsaKeyResponse {
+  uint64 chat_id = 1;
+}
+
+message UpdateChatRsaKeyNotification {
+  uint64 chat_id = 1;
+  uint64 user_id = 2;
+  bytes rsa_public_key = 3;
+}
+
+// sending messages
+message SendMessageRequest {
+  uint64 chat_id = 1;
+  bytes encrypted_message = 2;
+  bytes message_ecdsa_signature = 3;
+}
+
+message SendMessageResponse {
+  uint64 chat_id = 1;
+  uint64 message_id = 2;
+}
+
+message SendMessageNotification {
+  uint64 chat_id = 1;
+  uint64 message_id = 2;
+  uint64 sender_user_id = 3;
+  bytes encrypted_message = 4;
+  bytes message_ecdsa_signature = 5;
+}
+
+// sending files
+message SendFileRequest {
+  uint64 chat_id = 1;
+  bytes encrypted_file = 2;
+  bytes encrypted_mime_type = 3;
+  bytes file_ecdsa_signature = 4;
+}
+
+message SendFileResponse {
+  uint64 chat_id = 1;
+  uint64 message_id = 2;
+}
+
+message SendFileNotification {
+  uint64 chat_id = 1;
+  uint64 message_id = 2;
+  uint64 sender_user_id = 3;
+  bytes encrypted_file = 4;
+  bytes encrypted_mime_type = 5;
+  bytes file_ecdsa_signature = 6;
+}
+
+
+message SubscriptionRequest {
+}
+
+message IncomingNotification {
+  oneof notification {
+    InitChatFromInitializerNotification init_chat_from_initializer_notification = 1;
+    InitChatFromReceiverNotification init_chat_from_receiver_notification = 2;
+    UpdateChatRsaKeyNotification update_chat_rsa_key_notification = 3;
+    SendMessageNotification send_message_notification = 4;
+    SendFileNotification send_file_notification = 5;
+  }
+  bytes ecdsa_signature = 6;
+}
+
+message GetNotificationsRequest {
+  uint32 limit = 1;
+}
+
+message GetNotificationsResponse {
+  repeated IncomingNotification notifications = 1;
+}
+
+service MessageService {
+  rpc InitChatFromInitializer(InitChatFromInitializerRequest) returns (InitChatFromInitializerResponse);
+  rpc InitChatFromReceiver(InitChatFromReceiverRequest) returns (InitChatFromReceiverResponse);
+  rpc UpdateChatRsaKey(UpdateChatRsaKeyRequest) returns (UpdateChatRsaKeyResponse);
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc SendFile(SendFileRequest) returns (SendFileResponse);
+  rpc GetNotifications(GetNotificationsRequest) returns (GetNotificationsResponse);
+
+  rpc SubscribeToIncomingNotifications(SubscriptionRequest) returns (stream IncomingNotification);
+}
