@@ -1,98 +1,30 @@
 import argparse
 import asyncio
 import enum
+import json
 import logging
 import os.path
 import sys
 import typing
 
-import grpc
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from grpc.aio import UnaryUnaryClientInterceptor
-from grpc.experimental import aio
+import aiohttp
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.shortcuts import CompleteStyle
 
-from sigilix_interface import crypto_utils
-from sigilix_interface.proto.messages import messages_pb2_grpc, messages_pb2
-from sigilix_interface.proto.users import users_pb2_grpc, users_pb2
+from sigilix_interface import crypto_utils, http_api_classes
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
 logger = logging.getLogger(__name__)
-has_mimetypes = False
 try:
     import mimetypes
-
-    has_mimetypes = True
 except ImportError:
     logger.warning("mimetypes module is not available")
-
-
-# Define utility function to extract the relevant notification from a message.
-def get_inner_notification(n):
-    # This function checks the type of notification and returns the corresponding notification object.
-    if not isinstance(n, messages_pb2.IncomingNotification):
-        raise ValueError("Invalid notification type")
-    # Check for the type of notification and return the appropriate one.
-    if n.init_chat_from_receiver_notification.chat_id:
-        return n.init_chat_from_receiver_notification
-    elif n.init_chat_from_initializer_notification.chat_id:
-        return n.init_chat_from_initializer_notification
-    elif n.update_chat_rsa_key_notification.chat_id:
-        return n.update_chat_rsa_key_notification
-    elif n.send_message_notification.chat_id:
-        return n.send_message_notification
-    elif n.send_file_notification.chat_id:
-        return n.send_file_notification
-    raise ValueError("Invalid notification")
-
-
-# Define an interceptor class for signing and verifying gRPC messages.
-class SigningInterceptor(UnaryUnaryClientInterceptor):
-    # This interceptor signs outgoing requests and verifies incoming responses.
-    def __init__(self, client):
-        self.client = client
-
-    async def intercept_unary_unary(self, continuation, client_call_details, request):
-        # Serialize the request data
-        serialized_request = request.SerializeToString()
-
-        # Sign the serialized data
-        signature = self.client.sign(serialized_request)
-
-        # Add the signature to the metadata
-        metadata = []
-        if client_call_details.metadata is not None:
-            metadata = list(client_call_details.metadata)
-        metadata.append(("signature_base64", signature))
-        metadata.append(("user_id", str(self.client.user_id)))
-
-        # Update the metadata in the call details
-        client_call_details = client_call_details._replace(metadata=metadata)
-
-        # Make the actual RPC call using the future method
-        response = await continuation(client_call_details, request)
-        result = await response
-
-        # Deserialize the response
-        serialized_response = result.SerializeToString()
-
-        for key, value in await response.initial_metadata():
-            if key == "serv_signature_base64":
-                server_signature = value
-                break
-        else:
-            raise ValueError("Server's signature is missing")
-
-        # Validate the server's signature
-        if not self.client.validate_signature(serialized_response, server_signature):
-            raise ValueError("Server's signature is invalid")
-
-        return result
+    mimetypes = None
 
 
 # Enum to represent chat roles in the system.
@@ -143,7 +75,7 @@ class ChatInfo:
         cls,
         chat_id: int,
         client: "SigilixMessengerClient",
-        notification: messages_pb2.IncomingNotification,
+        notification: http_api_classes.IncomingNotification,
         role: MyChatRole,
     ):
         """
@@ -152,7 +84,7 @@ class ChatInfo:
         Args:
             chat_id (int): The unique identifier for the chat session.
             client (SigilixMessengerClient): The client instance to which this chat belongs.
-            notification (messages_pb2.IncomingNotification): The incoming notification that triggered the chat initialization.
+            notification (http_api_classes.IncomingNotification): The incoming notification that triggered the chat initialization.
             role (MyChatRole): The role of the user in this chat (initializer or receiver).
 
         Returns:
@@ -162,10 +94,10 @@ class ChatInfo:
             ValueError: If the notification is not a recognized chat initialization notification.
         """
         if not isinstance(
-            get_inner_notification(notification),
+            notification.notification,
             (
-                messages_pb2.InitChatFromReceiverNotification,
-                messages_pb2.InitChatFromInitializerNotification,
+                http_api_classes.InitChatFromReceiverNotification,
+                http_api_classes.InitChatFromInitializerNotification,
             ),
         ):
             raise ValueError("Invalid notification")
@@ -174,12 +106,12 @@ class ChatInfo:
         chat_info.put_notification(notification)
         return chat_info
 
-    def put_notification(self, notification: messages_pb2.IncomingNotification):
+    def put_notification(self, notification: http_api_classes.IncomingNotification):
         """
         Adds an incoming notification to the processing queue.
 
         Args:
-            notification (messages_pb2.IncomingNotification): The incoming notification to be added to the queue.
+            notification (http_api_classes.IncomingNotification): The incoming notification to be added to the queue.
         """
         self._pending_incoming_notifications.put_nowait(notification)
 
@@ -257,62 +189,62 @@ class ChatInfo:
             ValueError: If an invalid chat ID is encountered or an invalid notification type is received.
         """
         while True:
-            res: messages_pb2.IncomingNotification = (
+            res: http_api_classes.IncomingNotification = (
                 await self._pending_incoming_notifications.get()
             )
-            notif = get_inner_notification(res)
+            notif = res.notification
             if not isinstance(
                 notif,
                 (
-                    messages_pb2.InitChatFromInitializerNotification,
-                    messages_pb2.InitChatFromReceiverNotification,
+                    http_api_classes.InitChatFromInitializerNotification,
+                    http_api_classes.InitChatFromReceiverNotification,
                 ),
             ):
                 chat_id = getattr(notif, "chat_id", None)
                 if chat_id and chat_id != self.chat_id:
                     raise ValueError("Invalid chat id!")
 
-            if isinstance(notif, messages_pb2.InitChatFromInitializerNotification):
+            if isinstance(notif, http_api_classes.InitChatFromInitializerNotification):
                 # receives from server, when user X wants to start dialog with user Y (self)
                 if self.role != MyChatRole.RECEIVER:
                     raise ValueError("Invalid role")
                 self.chat_id = notif.chat_id
                 self.set_other_rsa_public_key(
-                    notif.initializer_user_info.initial_rsa_public_key
+                    bytes(notif.initializer_user_info.initial_rsa_public_key)
                 )
                 self.set_other_ecdsa_public_key(
-                    notif.initializer_user_info.ecdsa_public_key
+                    bytes(notif.initializer_user_info.ecdsa_public_key)
                 )
                 self.log(
                     "Chat initialization was requested by user %d",
                     notif.initializer_user_info.user_id,
                 )
-            elif isinstance(notif, messages_pb2.InitChatFromReceiverNotification):
+            elif isinstance(notif, http_api_classes.InitChatFromReceiverNotification):
                 if self.role != MyChatRole.INITIALIZER:
                     raise ValueError("Invalid role")
                 self.set_other_rsa_public_key(
-                    notif.receiver_user_info.initial_rsa_public_key
+                    bytes(notif.receiver_user_info.initial_rsa_public_key)
                 )
                 self.set_other_ecdsa_public_key(
-                    notif.receiver_user_info.ecdsa_public_key
+                    bytes(notif.receiver_user_info.ecdsa_public_key)
                 )
                 self.log("Chat initialization was accepted")
-            elif isinstance(notif, messages_pb2.UpdateChatRsaKeyNotification):
-                self.set_other_rsa_public_key(notif.rsa_public_key)
+            elif isinstance(notif, http_api_classes.UpdateChatRsaKeyNotification):
+                self.set_other_rsa_public_key(bytes(notif.rsa_public_key))
                 self.log("Chat RSA key was updated")
-            elif isinstance(notif, messages_pb2.SendMessageNotification):
+            elif isinstance(notif, http_api_classes.SendMessageNotification):
                 decrypted_message = self._decrypt_message(
-                    notif.encrypted_message, notif.message_ecdsa_signature
+                    bytes(notif.encrypted_message), bytes(notif.message_ecdsa_signature)
                 )
                 self.log(f"Received a message: {decrypted_message}")
-            elif isinstance(notif, messages_pb2.SendFileNotification):
+            elif isinstance(notif, http_api_classes.SendFileNotification):
                 decrypted_mime_type, decrypted_data = self._decrypt_file(
-                    notif.encrypted_file,
-                    notif.encrypted_mime_type,
-                    notif.file_ecdsa_signature,
+                    bytes(notif.encrypted_file),
+                    bytes(notif.encrypted_mime_type),
+                    bytes(notif.file_ecdsa_signature),
                 )
 
-                if has_mimetypes:
+                if mimetypes is not None:
                     fileext = mimetypes.guess_extension(decrypted_mime_type)
                 else:
                     fileext = ".bin"
@@ -393,7 +325,7 @@ class ChatInfo:
         with open(file_path, "rb") as f:
             data = f.read()
 
-        if has_mimetypes:
+        if mimetypes is not None:
             mime_type = mimetypes.guess_type(file_path)[0]
         else:
             mime_type = "application/octet-stream"
@@ -446,6 +378,40 @@ class ChatInfo:
         return decrypted_mime_type.decode("utf-8"), decrypted_data
 
 
+class ErrorCode(enum.Enum):
+    """
+        type ErrorCodes int
+
+    const (
+            ErrCodeUnknown ErrorCodes = iota
+            ErrInternal
+            ErrUnauthenticated
+            ErrPermissionDenied
+            AlreadyExists
+            ErrNotFound
+    )
+    """
+
+    UNKNOWN = 0
+    INTERNAL = 1
+    UNAUTHENTICATED = 2
+    PERMISSION_DENIED = 3
+    ALREADY_EXISTS = 4
+    NOT_FOUND = 5
+
+
+class SigilixServerException(Exception):
+    def __init__(self, resp_json: dict):
+        self.code = ErrorCode(resp_json["code"])
+        self.message = resp_json["message"]
+
+    def __str__(self):
+        return f"Error code {self.code}: {self.message}"
+
+    def __repr__(self):
+        return f"SigilixServerException({self.code}, {self.message})"
+
+
 # Define the main SigilixMessengerClient class for the client application.
 class SigilixMessengerClient:
     """
@@ -458,12 +424,9 @@ class SigilixMessengerClient:
         ecdsa_key (EllipticCurvePrivateKey): The ECDSA private key for cryptographic operations.
         rsa_key (RSAPrivateKey): The RSA private key for cryptographic operations.
         addr (str): The server address for the messaging service.
-        host_ecdsa_public_key (EllipticCurvePublicKey): The server's ECDSA public key for signature verification.
         server_cert (Optional[bytes]): The server's certificate for establishing a TLS connection.
         use_tls (bool): Flag to enable or disable TLS for the connection.
         user_id (int): The unique identifier for the user, derived from the ECDSA public key.
-        _user_stub (Optional[UserServiceStub]): The gRPC stub for user-related services.
-        _messages_stub (Optional[MessageServiceStub]): The gRPC stub for message-related services.
         _logged_in_success (bool): Flag to indicate whether the user has logged in successfully.
         _chats (Dict[int, ChatInfo]): A dictionary of chat sessions indexed by chat IDs.
         _username (Optional[str]): The username of the client.
@@ -475,8 +438,6 @@ class SigilixMessengerClient:
         ecdsa_key: ec.EllipticCurvePrivateKey,
         rsa_key: rsa.RSAPrivateKey,
         addr: str,
-        host_ecdsa_public_key: ec.EllipticCurvePublicKey,
-        server_cert: typing.Optional[bytes],
         use_tls: bool = True,
         username: typing.Optional[str] = None,
         allow_search_by_username: bool = False,
@@ -489,8 +450,6 @@ class SigilixMessengerClient:
             ecdsa_key (EllipticCurvePrivateKey): The private ECDSA key for signing operations.
             rsa_key (RSAPrivateKey): The private RSA key for encryption/decryption operations.
             addr (str): The server address to connect to for the messaging service.
-            host_ecdsa_public_key (EllipticCurvePublicKey): The public ECDSA key of the server for verifying signatures.
-            server_cert (Optional[bytes]): The TLS certificate of the server; required if TLS is enabled.
             use_tls (bool, optional): Whether to use TLS for the connection. Defaults to True.
             username (Optional[str], optional): The desired username for the client. Defaults to None.
             allow_search_by_username (bool, optional): Whether the client can be searched by username. Defaults to False.
@@ -501,8 +460,7 @@ class SigilixMessengerClient:
             self.ecdsa_key.public_key()
         )
         self.addr = addr
-        self.host_ecdsa_public_key = host_ecdsa_public_key
-        self.server_cert = server_cert
+        self.base_url = f"https://{addr}/api/" if use_tls else f"http://{addr}/api/"
         self.use_tls = use_tls
         self.user_id = crypto_utils.generate_user_id_by_public_key(
             self.ecdsa_key.public_key()
@@ -514,12 +472,51 @@ class SigilixMessengerClient:
                 crypto_utils.ecdsa_public_key_to_bytes(self.ecdsa_key.public_key())
             ),
         )
-        self._user_stub = None
-        self._messages_stub = None
         self._logged_in_success = False
         self._chats: typing.Dict[int, ChatInfo] = {}
         self._username = username
         self._allow_search_by_username = allow_search_by_username
+
+    async def _make_request(
+        self,
+        request: http_api_classes.AbstractStruct,
+        path: str,
+        expected_response_type: typing.Type[http_api_classes.AbstractStruct],
+    ):
+        """
+        Make an HTTP request to the server.
+
+        Args:
+            request (Base): The request object to send to the server.
+            path (str): The path to send the request to.
+            expected_response_type (Type[Base]): The expected type of the response.
+
+        Raises:
+            ValueError: If the response type does not match the expected type.
+        """
+        async with aiohttp.ClientSession() as session:
+            full_path = f"{self.base_url}{path}"
+            data = json.dumps(request.dump(), separators=(",", ":")).encode("utf-8")
+            signature = self.sign(data)
+            logger.info(f"Sending request to {full_path}: {request.dump()}, signature: {signature}")
+            async with session.post(
+                full_path,
+                data=data,
+                headers={
+                    "X-Sigilix-User-Id": str(self.user_id),
+                    "X-Sigilix-Signature": signature,
+                    "Content-Type": "application/json",
+                },
+            ) as resp:
+                if resp.status >= 400:
+                    try:
+                        resp_json = await resp.json()
+                        raise SigilixServerException(resp_json)
+                    except Exception:
+                        pass
+                    raise ValueError(f"HTTP error: {resp.status}")
+                data = await resp.json()
+                return expected_response_type.load(data)
 
     def sign(self, data: bytes) -> str:
         """
@@ -538,22 +535,22 @@ class SigilixMessengerClient:
             )
         )
 
-    def validate_signature(self, data: bytes, signature: str) -> bool:
-        """
-        Validate a signature against the provided data using the server's ECDSA public key.
-
-        Args:
-            data (bytes): The data that was signed.
-            signature (str): The base64-encoded signature to verify.
-
-        Returns:
-            bool: True if the signature is valid, False otherwise.
-        """
-        return crypto_utils.validate_signature(
-            self.host_ecdsa_public_key,
-            data,
-            crypto_utils.base64_to_bytes(signature),
-        )
+    # def validate_signature(self, data: bytes, signature: str) -> bool:
+    #     """
+    #     Validate a signature against the provided data using the server's ECDSA public key.
+    #
+    #     Args:
+    #         data (bytes): The data that was signed.
+    #         signature (str): The base64-encoded signature to verify.
+    #
+    #     Returns:
+    #         bool: True if the signature is valid, False otherwise.
+    #     """
+    #     return crypto_utils.validate_signature(
+    #         self.host_ecdsa_public_key,
+    #         data,
+    #         crypto_utils.base64_to_bytes(signature),
+    #     )
 
     async def main_loop(self, signal_on_login: typing.Optional[asyncio.Event] = None):
         """
@@ -565,40 +562,31 @@ class SigilixMessengerClient:
         Raises:
             Any exceptions that occur during the login process or notification polling.
         """
-        credentials = grpc.ssl_channel_credentials(root_certificates=self.server_cert)
 
-        f = aio.insecure_channel if not self.use_tls else aio.secure_channel
-        kwargs = {} if not self.use_tls else {"credentials": credentials}
+        request = http_api_classes.LoginRequest(
+            client_ecdsa_public_key=self._pub_ecdsa_bytes,
+            client_rsa_public_key=crypto_utils.rsa_public_key_to_bytes_der(
+                self.rsa_key.public_key()
+            ),
+            # client_rsa_public_key=self.rsa_key.public_key().public_bytes(
+            #     format=
+            # ),
+        )
+        await self._make_request(request, "users/login", http_api_classes.LoginResponse)
 
-        async with f(
-            self.addr, interceptors=[SigningInterceptor(self)], **kwargs
-        ) as channel:
-            self._user_stub = users_pb2_grpc.UserServiceStub(channel)
-            self._messages_stub = messages_pb2_grpc.MessageServiceStub(channel)
-
-            request = users_pb2.LoginRequest(
-                client_ecdsa_public_key=self._pub_ecdsa_bytes,
-                client_rsa_public_key=crypto_utils.rsa_public_key_to_bytes_der(
-                    self.rsa_key.public_key()
-                ),
-                # client_rsa_public_key=self.rsa_key.public_key().public_bytes(
-                #     format=
-                # ),
-            )
-            await self._user_stub.Login(request)
-            self._logged_in_success = True
-            if signal_on_login is not None:
-                signal_on_login.set()
-            logger.info("Logged in successfully")
-            if self._username:
-                await self.set_username(self._username, self._allow_search_by_username)
-            while True:
-                for notif in (await self.get_notifications()).notifications:
-                    self._propagate_notification(notif)
-                await asyncio.sleep(1)
+        self._logged_in_success = True
+        if signal_on_login is not None:
+            signal_on_login.set()
+        logger.info("Logged in successfully")
+        if self._username:
+            await self.set_username(self._username, self._allow_search_by_username)
+        while True:
+            for notif in (await self.get_notifications()).notifications:
+                self._propagate_notification(notif)
+            await asyncio.sleep(1)
 
     def _propagate_notification(
-        self, incoming_notif: messages_pb2.IncomingNotification
+        self, incoming_notif: http_api_classes.IncomingNotification
     ):
         """
         Handle an incoming notification by either initializing a new chat session or passing
@@ -610,21 +598,21 @@ class SigilixMessengerClient:
         Raises:
             ValueError: If the notification is not associated with a known chat ID.
         """
-        notification = get_inner_notification(incoming_notif)
+        notification = incoming_notif.notification
 
-        chat_id = notification.chat_id
+        chat_id = getattr(notification, "chat_id", None)
         if chat_id:
             if chat_id not in self._chats:
                 if isinstance(
                     notification,
                     (
-                        messages_pb2.InitChatFromInitializerNotification,
-                        messages_pb2.InitChatFromReceiverNotification,
+                        http_api_classes.InitChatFromInitializerNotification,
+                        http_api_classes.InitChatFromReceiverNotification,
                     ),
                 ):
                     if isinstance(
                         notification,
-                        messages_pb2.InitChatFromInitializerNotification,
+                        http_api_classes.InitChatFromInitializerNotification,
                     ):
                         role = MyChatRole.RECEIVER
                     else:
@@ -642,95 +630,85 @@ class SigilixMessengerClient:
         else:
             logger.error("Received notification without chat id")
 
-    @property
-    def users(self) -> users_pb2_grpc.UserServiceStub:
-        """
-        Provides access to the gRPC stub for user-related services.
-
-        Returns:
-            UserServiceStub: The gRPC stub for user services.
-        """
-        return self._user_stub
-
-    @property
-    def messages(self) -> messages_pb2_grpc.MessageServiceStub:
-        """
-        Provides access to the gRPC stub for message-related services.
-
-        Returns:
-            MessageServiceStub: The gRPC stub for message services.
-        """
-        return self._messages_stub
 
     async def set_username(self, username: str, search_by_username_allowed: bool):
-        return await self._user_stub.SetUsernameConfig(
-            users_pb2.SetUsernameConfigRequest(
+        return await self._make_request(
+            http_api_classes.SetUsernameConfigRequest(
                 username=username,
                 search_by_username_allowed=search_by_username_allowed,
-            )
+            ),
+            "users/set_username_config",
+            http_api_classes.SetUsernameConfigResponse,
         )
 
     async def search_by_username(
         self, username: str
-    ) -> typing.Optional[users_pb2.SearchByUsernameResponse]:
-        res = await self._user_stub.SearchByUsername(
-            users_pb2.SearchByUsernameRequest(
+    ) -> typing.Optional[http_api_classes.SearchByUsernameResponse]:
+        # )
+        res = await self._make_request(
+            http_api_classes.SearchByUsernameRequest(
                 username=username,
-            )
+            ),
+            "users/search_by_username",
+            http_api_classes.SearchByUsernameResponse,
         )
-        if res.public_info:
+        if res.public_info.user_id:
             return res
         return None
 
     async def init_chat_from_initializer(
         self,
         target_user_id: int,
-    ) -> messages_pb2.InitChatFromInitializerResponse:
-        res = await self._messages_stub.InitChatFromInitializer(
-            messages_pb2.InitChatFromInitializerRequest(
+    ) -> http_api_classes.InitChatFromInitializerResponse:
+        return await self._make_request(
+            http_api_classes.InitChatFromInitializerRequest(
                 target_user_id=target_user_id,
-            )
+            ),
+            "messages/init_chat_from_initializer",
+            http_api_classes.InitChatFromInitializerResponse,
         )
-        return res
 
     async def init_chat_from_receiver(
         self,
         chat_id: int,
-    ) -> messages_pb2.InitChatFromReceiverResponse:
-        res = await self._messages_stub.InitChatFromReceiver(
-            messages_pb2.InitChatFromReceiverRequest(
+    ) -> http_api_classes.InitChatFromReceiverResponse:
+        return await self._make_request(
+            http_api_classes.InitChatFromReceiverRequest(
                 chat_id=chat_id,
-            )
+            ),
+            "messages/init_chat_from_receiver",
+            http_api_classes.InitChatFromReceiverResponse,
         )
-        return res
 
     async def update_chat_rsa_key(
         self,
         chat_id: int,
         rsa_public_key: bytes,
-    ) -> messages_pb2.UpdateChatRsaKeyResponse:
-        res = await self._messages_stub.UpdateChatRsaKey(
-            messages_pb2.UpdateChatRsaKeyRequest(
+    ) -> http_api_classes.UpdateChatRsaKeyResponse:
+        return await self._make_request(
+            http_api_classes.UpdateChatRsaKeyRequest(
                 chat_id=chat_id,
                 rsa_public_key=rsa_public_key,
-            )
+            ),
+            "messages/update_chat_rsa_key",
+            http_api_classes.UpdateChatRsaKeyResponse,
         )
-        return res
 
     async def send_message(
         self,
         chat_id: int,
         encrypted_message: bytes,
         message_ecdsa_signature: bytes,
-    ) -> messages_pb2.SendMessageResponse:
-        res = await self._messages_stub.SendMessage(
-            messages_pb2.SendMessageRequest(
+    ) -> http_api_classes.SendMessageResponse:
+        return await self._make_request(
+            http_api_classes.SendMessageRequest(
                 chat_id=chat_id,
                 encrypted_message=encrypted_message,
                 message_ecdsa_signature=message_ecdsa_signature,
-            )
+            ),
+            "messages/send_message",
+            http_api_classes.SendMessageResponse,
         )
-        return res
 
     async def send_file(
         self,
@@ -738,26 +716,28 @@ class SigilixMessengerClient:
         encrypted_file: bytes,
         encrypted_mime_type: bytes,
         file_ecdsa_signature: bytes,
-    ) -> messages_pb2.SendFileResponse:
-        res = await self._messages_stub.SendFile(
-            messages_pb2.SendFileRequest(
+    ) -> http_api_classes.SendFileResponse:
+        return await self._make_request(
+            http_api_classes.SendFileRequest(
                 chat_id=chat_id,
                 encrypted_file=encrypted_file,
                 encrypted_mime_type=encrypted_mime_type,
                 file_ecdsa_signature=file_ecdsa_signature,
-            )
+            ),
+            "messages/send_file",
+            http_api_classes.SendFileResponse,
         )
-        return res
 
     async def get_notifications(
         self, limit: int = 10
-    ) -> messages_pb2.GetNotificationsResponse:
-        res = await self._messages_stub.GetNotifications(
-            messages_pb2.GetNotificationsRequest(
+    ) -> http_api_classes.GetNotificationsResponse:
+        return await self._make_request(
+            http_api_classes.GetNotificationsRequest(
                 limit=limit,
-            )
+            ),
+            "messages/get_notifications",
+            http_api_classes.GetNotificationsResponse,
         )
-        return res
 
     def chat(self, chat_id: int) -> ChatInfo:
         """
@@ -927,20 +907,6 @@ async def main():
         help="Host address to connect to",
     )
     parser.add_argument(
-        "-hp",
-        "--host-ecdsa-public-key",
-        type=str,
-        required=True,
-        help="Host ECDSA public key",
-    )
-    parser.add_argument(
-        "-hc",
-        "--host-cert",
-        type=str,
-        required=False,
-        help="Path to host certificate",
-    )
-    parser.add_argument(
         "-u",
         "--username",
         type=str,
@@ -955,14 +921,6 @@ async def main():
         help="Disable TLS",
     )
     args = parser.parse_args()
-    if args.host_cert is not None:
-        with open(args.host_cert, "rb") as f:
-            cert_data = f.read()
-    else:
-        cert_data = None
-
-    if not cert_data and not args.notls:
-        raise ValueError("TLS is enabled but host certificate is not provided")
 
     if args.notls:
         logger.warning("TLS is disabled")
@@ -981,10 +939,6 @@ async def main():
         ),
         rsa_key=crypto_utils.rsa_private_key_from_bytes_pem(args.rsa_key.encode()),
         addr=args.addr,
-        host_ecdsa_public_key=crypto_utils.ecdsa_public_key_from_bytes(
-            crypto_utils.base64_to_bytes(args.host_ecdsa_public_key)
-        ),
-        server_cert=cert_data,
         username=args.username,
         allow_search_by_username=args.username is not None,
         use_tls=not args.notls,

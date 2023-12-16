@@ -81,12 +81,16 @@ def sign_message(private_key: ec.EllipticCurvePrivateKey, data: bytes) -> bytes:
 
 
 def ecdsa_private_key_to_bytes(private_key: ec.EllipticCurvePrivateKey) -> bytes:
-    return private_key.private_numbers().private_value.to_bytes(byteorder="big", length=key_size_in_bytes) + ecdsa_public_key_to_bytes(private_key.public_key())
+    return private_key.private_numbers().private_value.to_bytes(
+        byteorder="big", length=key_size_in_bytes
+    ) + ecdsa_public_key_to_bytes(private_key.public_key())
 
 
 def ecdsa_private_key_from_bytes(data: bytes) -> ec.EllipticCurvePrivateKey:
     if len(data) != (3 * key_size_in_bytes) + 1:
-        raise ValueError(f"invalid key size: {len(data)} instead of {key_size_in_bytes}")
+        raise ValueError(
+            f"invalid key size: {len(data)} instead of {key_size_in_bytes}"
+        )
     d = int.from_bytes(data[:key_size_in_bytes], "big")
     data = data[key_size_in_bytes:]
     data = data[1:]  # remove curve type
@@ -100,7 +104,10 @@ def ecdsa_private_key_from_bytes(data: bytes) -> ec.EllipticCurvePrivateKey:
 
 def generate_user_id_by_public_key(public_key):
     data = ecdsa_public_key_to_bytes(public_key)
+    print("key:          ", data.hex())
     hashed = hash_data(data)
+    print("full SHA256:  ", hashed.hex())
+    print("first 8 bytes:", hashed[:8].hex())
     return int.from_bytes(hashed[:8], byteorder="big")
 
 
@@ -128,17 +135,21 @@ def rsa_private_key_from_bytes_pem(data: bytes) -> rsa.RSAPrivateKey:
     )
 
 
-def rsa_public_key_to_bytes_pem(public_key: rsa.RSAPublicKey) -> bytes:
+def rsa_public_key_to_bytes_der(public_key: rsa.RSAPublicKey) -> bytes:
     return public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
+        encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
 
-def rsa_public_key_from_bytes_pem(data: bytes) -> rsa.RSAPublicKey:
-    return serialization.load_pem_public_key(
+def rsa_public_key_from_bytes_der(data: bytes) -> rsa.RSAPublicKey:
+    # return serialization.load_pem_public_key(
+    #     data,
+    #     backend=default_backend(),
+    # )
+    return serialization.load_der_public_key(
         data,
-        backend=default_backend(),
+        backend=default_backend()
     )
 
 
@@ -167,7 +178,17 @@ def rsa_decrypt(private_key: rsa.RSAPrivateKey, data: bytes) -> bytes:
 if __name__ == "__main__":
 
     def main():
-        print(bytes_to_base64(ecdsa_private_key_to_bytes(generate_ecdsa_private_key())))
+        a = "039FCFE20EDAA14049FEE0A79D307B6F63E7C19CEE5D148CE832F1B594C9FB3352"
+        a_bytes = bytes.fromhex(a)
+        #
+        k = ecdsa_public_key_from_bytes(a_bytes)
+        # print(k.public_numbers())
+        # print(ecdsa_public_key_to_bytes(k).hex())
+        # print(generate_user_id_by_public_key(k))
+        data_str = bytes.fromhex("0a4104ba21baad1cb70701d86721b6e98a6dec661454ebdaa2c1eefb16494fe11f330c27ef14129c93fbd9dbeb76a52a85efb0aadf4d1b66750e2ff467ec05a0707462125e305c300d06092a864886f70d0101010500034b00304802410091e60d8b43f9a087873a413d16b7efb08a8e931fcce2f30d9a9c2f81c5edb948cb3182e33874d3dbf053dd4aa86c4276808c193bed09283a5e902c1e814362370203313131")
+        sig = "FB CB BB 17 D1 EC 4F 1B 5B 4F 24 E5 3A 6C 70 E4 96 03 38 C3 48 DA 96 96 BF 5C B5 CE 73 42 E1 2C AD 4A 16 F5 56 FF CF 67 B4 86 FB B8 71 35 C5 99 19 46 C4 6D 1A 42 25 61 EC D6 7F 6B 12 D8 CE D2".replace(" ", "")
+        sig_bytes = bytes.fromhex(sig)
+        print(validate_signature(k, data_str, sig_bytes))
 
     main()
 
@@ -186,7 +207,7 @@ __all__ = [
     "generate_rsa_key",
     "rsa_private_key_to_bytes_pem",
     "rsa_private_key_from_bytes_pem",
-    "rsa_public_key_to_bytes_pem",
-    "rsa_public_key_from_bytes_pem",
+    "rsa_public_key_to_bytes_der",
+    "rsa_public_key_from_bytes_der",
     "rsa_encrypt",
 ]
