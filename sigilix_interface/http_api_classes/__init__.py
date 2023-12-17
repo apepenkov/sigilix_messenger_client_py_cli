@@ -238,6 +238,9 @@ class SearchByUsernameResponse(AbstractStruct):
     def load(cls, data):
         return cls(public_info=PublicUserInfo.load(data.get("public_info", {})))
 
+    def dump(self):
+        return {"public_info": self.public_info.dump()}
+
 
 # InitChatFromInitializerRequest class
 class InitChatFromInitializerRequest(AbstractStruct):
@@ -609,7 +612,7 @@ class IncomingNotification(AbstractStruct):
 
     @classmethod
     def load(cls, data):
-        notification_type = data["notification"]["type"]
+        notification_type = data["type"]
         notification = None
 
         if notification_type == NotificationType.INIT_CHAT_FROM_INITIALIZER.value:

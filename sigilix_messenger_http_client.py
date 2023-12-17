@@ -498,7 +498,7 @@ class SigilixMessengerClient:
             full_path = f"{self.base_url}{path}"
             data = json.dumps(request.dump(), separators=(",", ":")).encode("utf-8")
             signature = self.sign(data)
-            logger.info(f"Sending request to {full_path}: {request.dump()}, signature: {signature}")
+            # logger.info(f"Sending request to {full_path}: {request.dump()}, signature: {signature}")
             async with session.post(
                 full_path,
                 data=data,
