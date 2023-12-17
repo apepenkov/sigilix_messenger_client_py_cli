@@ -104,11 +104,8 @@ def ecdsa_private_key_from_bytes(data: bytes) -> ec.EllipticCurvePrivateKey:
 
 def generate_user_id_by_public_key(public_key):
     data = ecdsa_public_key_to_bytes(public_key)
-    print("key:          ", data.hex())
     hashed = hash_data(data)
-    print("full SHA256:  ", hashed.hex())
-    print("first 8 bytes:", hashed[:8].hex())
-    return int.from_bytes(hashed[:8], byteorder="big")
+    return int.from_bytes(hashed[:4], byteorder="big")
 
 
 def generate_rsa_key() -> rsa.RSAPrivateKey:

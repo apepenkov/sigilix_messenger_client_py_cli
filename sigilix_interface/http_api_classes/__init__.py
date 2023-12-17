@@ -658,6 +658,7 @@ class IncomingNotification(AbstractStruct):
             "type": notification_type,
         }
 
+
 class GetNotificationsRequest(AbstractStruct):
     limit: int
 
@@ -670,6 +671,7 @@ class GetNotificationsRequest(AbstractStruct):
 
     def dump(self) -> dict:
         return {"limit": self.limit}
+
 
 # GetNotificationsResponse class
 class GetNotificationsResponse(AbstractStruct):

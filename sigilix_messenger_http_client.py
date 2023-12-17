@@ -568,9 +568,6 @@ class SigilixMessengerClient:
             client_rsa_public_key=crypto_utils.rsa_public_key_to_bytes_der(
                 self.rsa_key.public_key()
             ),
-            # client_rsa_public_key=self.rsa_key.public_key().public_bytes(
-            #     format=
-            # ),
         )
         await self._make_request(request, "users/login", http_api_classes.LoginResponse)
 
