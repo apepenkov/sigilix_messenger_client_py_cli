@@ -2,11 +2,13 @@ import argparse
 import asyncio
 import enum
 import json
+import time
 import logging
 import os.path
 import sys
 import typing
 
+import aioconsole
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 import aiohttp
 from prompt_toolkit import PromptSession
@@ -237,6 +239,9 @@ class ChatInfo:
                     bytes(notif.encrypted_message), bytes(notif.message_ecdsa_signature)
                 )
                 self.log(f"Received a message: {decrypted_message}")
+                chat = self.client.chat(self.chat_id)
+                if chat.ready_for_communication and "Echo" not in decrypted_message:
+                    await chat.send_message(f"Echo: {decrypted_message}")
             elif isinstance(notif, http_api_classes.SendFileNotification):
                 decrypted_mime_type, decrypted_data = self._decrypt_file(
                     bytes(notif.encrypted_file),
@@ -389,6 +394,7 @@ class ErrorCode(enum.Enum):
             ErrPermissionDenied
             AlreadyExists
             ErrNotFound
+            ErrInvalidRequest
     )
     """
 
@@ -398,6 +404,7 @@ class ErrorCode(enum.Enum):
     PERMISSION_DENIED = 3
     ALREADY_EXISTS = 4
     NOT_FOUND = 5
+    ErrInvalidRequest = 6
 
 
 class SigilixServerException(Exception):
@@ -476,6 +483,8 @@ class SigilixMessengerClient:
         self._chats: typing.Dict[int, ChatInfo] = {}
         self._username = username
         self._allow_search_by_username = allow_search_by_username
+        self.auto_accept_chats = False
+        self._session = aiohttp.ClientSession()
 
     async def _make_request(
         self,
@@ -494,29 +503,37 @@ class SigilixMessengerClient:
         Raises:
             ValueError: If the response type does not match the expected type.
         """
-        async with aiohttp.ClientSession() as session:
-            full_path = f"{self.base_url}{path}"
-            data = json.dumps(request.dump(), separators=(",", ":")).encode("utf-8")
-            signature = self.sign(data)
-            # logger.info(f"Sending request to {full_path}: {request.dump()}, signature: {signature}")
-            async with session.post(
-                full_path,
-                data=data,
-                headers={
-                    "X-Sigilix-User-Id": str(self.user_id),
-                    "X-Sigilix-Signature": signature,
-                    "Content-Type": "application/json",
-                },
-            ) as resp:
-                if resp.status >= 400:
-                    try:
-                        resp_json = await resp.json()
-                        raise SigilixServerException(resp_json)
-                    except Exception:
-                        pass
-                    raise ValueError(f"HTTP error: {resp.status}")
-                data = await resp.json()
-                return expected_response_type.load(data)
+        time_start = time.time()
+        full_path = f"{self.base_url}{path}"
+        data = json.dumps(request.dump(), separators=(",", ":")).encode("utf-8")
+        signature = self.sign(data)
+        signing_time = time.time() - time_start
+
+        request_start = time.time()
+        async with self._session.post(
+            full_path,
+            data=data,
+            headers={
+                "X-Sigilix-User-Id": str(self.user_id),
+                "X-Sigilix-Signature": signature,
+                "Content-Type": "application/json",
+            },
+        ) as resp:
+            request_time = time.time() - request_start
+            if path != "messages/get_notifications":
+                # logger.info(f"Sending request to {full_path}: {request.dump()}, signature: {signature}, signing time: {signing_time}, request time: {request_time}")
+                logger.info(f"Sending request to {full_path}: request time: {request_time}")
+            if resp.status >= 400:
+                try:
+                    resp_json = await resp.json()
+                    raise SigilixServerException(resp_json)
+                except SigilixServerException:
+                    raise
+                except Exception:
+                    pass
+                raise ValueError(f"HTTP error: {resp.status}")
+            data = await resp.json()
+            return expected_response_type.load(data)
 
     def sign(self, data: bytes) -> str:
         """
@@ -618,6 +635,10 @@ class SigilixMessengerClient:
                     self._chats[chat_id] = ChatInfo.init_from_notification(
                         chat_id, self, incoming_notif, role
                     )
+
+                    if self.auto_accept_chats and role == MyChatRole.RECEIVER:
+                        logger.info(f"Auto-accepting chat {chat_id}")
+                        asyncio.create_task(self._chats[chat_id].accept())
                 else:
                     logger.warning(
                         f"Received non-init notification for unknown chat id: {chat_id}"
@@ -949,7 +970,68 @@ async def main():
     if cli:
         await cli.prepare_and_run()
     else:
-        await client.main_loop()
+        client.auto_accept_chats = True
+        sig = asyncio.Event()
+        asyncio.create_task(client.main_loop(sig))
+        await sig.wait()
+
+        while True:
+            try:
+                inp = await aioconsole.ainput("Command: ")
+                if len(inp) == 0:
+                    continue
+                cmd, *args = inp.split()
+                cmd = cmd.lower()
+                if cmd == "exit":
+                    break
+                elif cmd == "send":
+                    chat_id, *message = args
+                    message = " ".join(message)
+                    try:
+                        chat = client.chat(int(chat_id))
+                    except ValueError:
+                        print("Invalid chat id")
+                        continue
+                    await chat.send_message(message)
+                    print("Message sent")
+                elif cmd == "accept":
+                    chat_id = args[0]
+                    try:
+                        chat = client.chat(int(chat_id))
+                    except ValueError:
+                        print("Invalid chat id")
+                        continue
+                    await chat.accept()
+                    print("Chat accepted")
+                elif cmd == "search":
+                    username = args[0]
+                    res = await client.search_by_username(username)
+                    if not res:
+                        print("User not found")
+                    else:
+                        print(f"User found: {res.public_info.user_id}")
+                elif cmd == "request_chat":
+                    user_id = args[0]
+                    chat = await client.request_chat(int(user_id))
+                    print(f"Chat created: {chat.chat_id}")
+                elif cmd == "help":
+                    print(
+                        """Available commands:
+    - exit: exit the CLI
+    - send <chat_id> <message>: send a message to a chat
+    - accept <chat_id>: accept a chat invitation
+    - search <username>: search a user by username
+    - request_chat <user_id>: request a chat with a user
+    - help: print this help
+    """
+                    )
+            except SigilixServerException as e:
+                print(e, file=sys.stderr)
+                continue
+            except Exception as e:
+                logger.exception(e)
+                continue
+
 
 
 if __name__ == "__main__":

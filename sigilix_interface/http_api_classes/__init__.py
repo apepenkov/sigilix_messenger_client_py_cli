@@ -81,10 +81,10 @@ class PublicUserInfo(AbstractStruct):
     @classmethod
     def load(cls, data: dict) -> "PublicUserInfo":
         return cls(
-            user_id=data["user_id"],
-            ecdsa_public_key=Base64Bytes.load(data["ecdsa_public_key"]),
-            username=data["username"],
-            initial_rsa_public_key=Base64Bytes.load(data["initial_rsa_public_key"]),
+            user_id=data.get("user_id", 0),
+            ecdsa_public_key=Base64Bytes.load(data.get("ecdsa_public_key", "")),
+            username=data.get("username", ""),
+            initial_rsa_public_key=Base64Bytes.load(data.get("initial_rsa_public_key", "")),
         )
 
     def dump(self) -> dict:
@@ -236,7 +236,7 @@ class SearchByUsernameResponse(AbstractStruct):
 
     @classmethod
     def load(cls, data):
-        return cls(public_info=PublicUserInfo.load(data.get("public_info", {})))
+        return cls(public_info=PublicUserInfo.load(data.get("public_info", None) or dict()))
 
     def dump(self):
         return {"public_info": self.public_info.dump()}

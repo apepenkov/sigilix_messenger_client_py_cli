@@ -1,4 +1,5 @@
 import base64
+import typing
 from typing import Tuple
 
 from cryptography.exceptions import InvalidSignature
@@ -11,7 +12,6 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
     decode_dss_signature,
 )
 import hashlib
-
 
 elliptic_curve = ec.SECP256R1()
 key_size_in_bytes = (elliptic_curve.key_size + 7) // 8
@@ -105,7 +105,8 @@ def ecdsa_private_key_from_bytes(data: bytes) -> ec.EllipticCurvePrivateKey:
 def generate_user_id_by_public_key(public_key):
     data = ecdsa_public_key_to_bytes(public_key)
     hashed = hash_data(data)
-    return int.from_bytes(hashed[:4], byteorder="big")
+    buf = bytes([0x00, 0x00, 0x00, 0x00]) + hashed[:4]
+    return int.from_bytes(buf, byteorder="big")
 
 
 def generate_rsa_key() -> rsa.RSAPrivateKey:
@@ -144,13 +145,10 @@ def rsa_public_key_from_bytes_der(data: bytes) -> rsa.RSAPublicKey:
     #     data,
     #     backend=default_backend(),
     # )
-    return serialization.load_der_public_key(
-        data,
-        backend=default_backend()
-    )
+    return serialization.load_der_public_key(data, backend=default_backend())
 
 
-def rsa_encrypt(public_key: rsa.RSAPublicKey, data: bytes) -> bytes:
+def rsa_encrypt_chunk(public_key: rsa.RSAPublicKey, data: bytes) -> bytes:
     return public_key.encrypt(
         data,
         padding=padding.OAEP(
@@ -161,7 +159,7 @@ def rsa_encrypt(public_key: rsa.RSAPublicKey, data: bytes) -> bytes:
     )
 
 
-def rsa_decrypt(private_key: rsa.RSAPrivateKey, data: bytes) -> bytes:
+def rsa_decrypt_chunk(private_key: rsa.RSAPrivateKey, data: bytes) -> bytes:
     return private_key.decrypt(
         data,
         padding=padding.OAEP(
@@ -172,23 +170,42 @@ def rsa_decrypt(private_key: rsa.RSAPrivateKey, data: bytes) -> bytes:
     )
 
 
+def rsa_encrypt(public_key: rsa.RSAPublicKey, data: bytes) -> bytes:
+    keysize_bytes = public_key.key_size // 8
+    max_data_chunk_size = (keysize_bytes - 2 * hashes.SHA256.digest_size - 2) - 1
+
+    chunk_count = (len(data) + max_data_chunk_size - 1) // max_data_chunk_size
+    data_out = bytearray()
+    for i in range(chunk_count):
+        chunk = data[i * max_data_chunk_size : (i + 1) * max_data_chunk_size]
+        data_out += rsa_encrypt_chunk(public_key, chunk)
+    return bytes(data_out)
+
+
+def rsa_decrypt(private_key: rsa.RSAPrivateKey, data: bytes) -> bytes:
+    keysize_bytes = private_key.key_size // 8
+    max_data_chunk_size = (keysize_bytes - 2 * hashes.SHA256.digest_size - 2) - 1
+    output_chunk_size = keysize_bytes
+
+    if len(data) % output_chunk_size != 0:
+        raise ValueError("invalid data size")
+
+    chunk_count = len(data) // output_chunk_size
+    data_out = bytearray()
+    for i in range(chunk_count):
+        chunk = data[i * output_chunk_size : (i + 1) * output_chunk_size]
+        data_out += rsa_decrypt_chunk(private_key, chunk)
+    return bytes(data_out)
+
+
 if __name__ == "__main__":
 
     def main():
-        a = "039FCFE20EDAA14049FEE0A79D307B6F63E7C19CEE5D148CE832F1B594C9FB3352"
-        a_bytes = bytes.fromhex(a)
-        #
-        k = ecdsa_public_key_from_bytes(a_bytes)
-        # print(k.public_numbers())
-        # print(ecdsa_public_key_to_bytes(k).hex())
-        # print(generate_user_id_by_public_key(k))
-        data_str = bytes.fromhex("0a4104ba21baad1cb70701d86721b6e98a6dec661454ebdaa2c1eefb16494fe11f330c27ef14129c93fbd9dbeb76a52a85efb0aadf4d1b66750e2ff467ec05a0707462125e305c300d06092a864886f70d0101010500034b00304802410091e60d8b43f9a087873a413d16b7efb08a8e931fcce2f30d9a9c2f81c5edb948cb3182e33874d3dbf053dd4aa86c4276808c193bed09283a5e902c1e814362370203313131")
-        sig = "FB CB BB 17 D1 EC 4F 1B 5B 4F 24 E5 3A 6C 70 E4 96 03 38 C3 48 DA 96 96 BF 5C B5 CE 73 42 E1 2C AD 4A 16 F5 56 FF CF 67 B4 86 FB B8 71 35 C5 99 19 46 C4 6D 1A 42 25 61 EC D6 7F 6B 12 D8 CE D2".replace(" ", "")
-        sig_bytes = bytes.fromhex(sig)
-        print(validate_signature(k, data_str, sig_bytes))
+        key = generate_rsa_key()
+
+        print(key.key_size)
 
     main()
-
 
 __all__ = [
     "base64_to_bytes",
